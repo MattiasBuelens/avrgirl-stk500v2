@@ -6,6 +6,7 @@ var async = require('async');
 var libusb = require('./lib/libusb-comms');
 var serialcom = require('./lib/serialport-comms');
 var intelhex = require('intel-hex');
+var callbackify = require('util').callbackify;
 
 function avrgirlStk500v2(options) {
   this.options = {
@@ -35,14 +36,10 @@ function avrgirlStk500v2(options) {
 
 util.inherits(avrgirlStk500v2, EventEmitter);
 
-avrgirlStk500v2.prototype._setupComms = function() {
+avrgirlStk500v2.prototype._setupComms = async function() {
   this.debug('setting up communication interface');
-  var self = this;
-  this.device.setUpInterface(function(error) {
-    if (!error) {
-      setImmediate(emitReady, self);
-    }
-  });
+  await this.device.setUpInterface();
+  setImmediate(emitReady, this);
 }
 
 function emitReady(self) {
@@ -74,10 +71,10 @@ avrgirlStk500v2.prototype.frame = function (buffer) {
   return framed;
 };
 
-avrgirlStk500v2.prototype.write = function (buffer, callback) {
+avrgirlStk500v2.prototype._writeAsync = async function (buffer) {
   if (!Buffer.isBuffer(buffer)) {
     if (!Array.isArray(buffer)) {
-      return callback(new Error('Failed to write: data was not Buffer or Array object.'));
+      throw new Error('Failed to write: data was not Buffer or Array object.');
     }
     var buffer = Buffer.from(buffer);
   }
@@ -86,41 +83,38 @@ avrgirlStk500v2.prototype.write = function (buffer, callback) {
 
   this.debug('writing', data);
 
-  this.device.write(data, function (error) {
-    callback(error);
-  });
+  await this.device.write(data);
 };
 
-avrgirlStk500v2.prototype.read = function (length, callback) {
-  var self = this;
-  if (typeof length !== 'number') { return callback(new Error('Failed to read: length must be a number.')) }
-  this.device.read(length, function (error, data) {
-    //var buffer = (self.options.frameless) ? data : data.slice(6);
-    var buffer = data || [];
-    self.debug('read', buffer);
-    callback(error, buffer);
-  });
+avrgirlStk500v2.prototype.write = callbackify(avrgirlStk500v2.prototype._writeAsync);
+
+avrgirlStk500v2.prototype._readAsync = async function (length) {
+  if (typeof length !== 'number') { throw new Error('Failed to read: length must be a number.'); }
+  var data = await this.device.read(length);
+  //var buffer = (this.options.frameless) ? data : data.slice(6);
+  var buffer = data || [];
+  this.debug('read', buffer);
+  return buffer;
 };
 
-avrgirlStk500v2.prototype.sendCmd = function(cmd, callback) {
-  var self = this;
+avrgirlStk500v2.prototype.read = callbackify(avrgirlStk500v2.prototype._readAsync);
+
+avrgirlStk500v2.prototype._sendCmdAsync = async function(cmd) {
   var frameless = this.options.frameless;
   var readLen = frameless ? 2 : 8;
   var statusPos = frameless ? 1 : 6;
 
-  this.write(cmd, function (error) {
-    if (error) { return callback(error); }
-    self.read(readLen, function (error, data) {
-      if (!error && data && data.length > 0 && data[statusPos] !== C.STATUS_CMD_OK) {
-        var error = new Error('Return status was not OK. Received instead: ' + data.toString('hex'));
-      }
-      callback(error);
-    });
-  });
+  await this._writeAsync(cmd);
+  var data = await this._readAsync(readLen);
+  if (data && data.length > 0 && data[statusPos] !== C.STATUS_CMD_OK) {
+    throw new Error('Return status was not OK. Received instead: ' + data.toString('hex'));
+  }
+  return data;
 };
 
-avrgirlStk500v2.prototype.getSignature = function (callback) {
-  var self = this;
+avrgirlStk500v2.prototype.sendCmd = callbackify(avrgirlStk500v2.prototype._sendCmdAsync);
+
+avrgirlStk500v2.prototype._getSignatureAsync = async function () {
   var cmd = Buffer.from([C.CMD_SIGN_ON]);
   var frameless = this.options.frameless;
   var readLen = frameless ? 3 : 9;
@@ -128,27 +122,26 @@ avrgirlStk500v2.prototype.getSignature = function (callback) {
   var sigPos = frameless ? 3 : 8;
   var foot = frameless ? 0 : 1;
 
-  this.write(cmd, function (error) {
-    if (error) { callback(error); }
-    self.read(20 + readLen, function (error, data) {
-      if (data[statusPos] !== C.STATUS_CMD_OK) {
-        error = new Error('Failed to verify: programmer return status was not OK.');
-      }
-      var signature = data.slice(sigPos, data.length - foot);
-      callback(null, signature);
-    });
-  });
-};
-
-avrgirlStk500v2.prototype.verifySignature = function (sig, data, callback) {
-  var error = null;
-  if (!sig.equals(data)) {
-    error = new Error('Failed to verify: signature does not match.');
+  await this._writeAsync(cmd);
+  var data = await this._readAsync(20 + readLen);
+  if (data[statusPos] !== C.STATUS_CMD_OK) {
+    throw new Error('Failed to verify: programmer return status was not OK.');
   }
-  callback(error);
+  var signature = data.slice(sigPos, data.length - foot);
+  return signature;
 };
 
-avrgirlStk500v2.prototype.loadAddress = function (memType, address, callback) {
+avrgirlStk500v2.prototype.getSignature = callbackify(avrgirlStk500v2.prototype._getSignatureAsync);
+
+avrgirlStk500v2.prototype._verifySignatureAsync = async function (sig, data) {
+  if (!sig.equals(data)) {
+    throw new Error('Failed to verify: signature does not match.');
+  }
+};
+
+avrgirlStk500v2.prototype.verifySignature = callbackify(avrgirlStk500v2.prototype._verifySignatureAsync);
+
+avrgirlStk500v2.prototype._loadAddressAsync = async function (memType, address) {
   var dMSB = memType === 'flash' ? 0x80 : 0x00;
   var msb = (address >> 24) & 0xFF | dMSB;
   var xsb = (address >> 16) & 0xFF;
@@ -157,15 +150,18 @@ avrgirlStk500v2.prototype.loadAddress = function (memType, address, callback) {
 
   var cmd = Buffer.from([C.CMD_LOAD_ADDRESS, msb, xsb, ysb, lsb]);
 
-  this.sendCmd(cmd, function (error) {
-    var error = error ? new Error('Failed to load address: return status was not OK.') : null;
-    callback(error);
-  });
+  try {
+    await this._sendCmdAsync(cmd);
+  } catch (e) {
+    throw new Error('Failed to load address: return status was not OK.');
+  }
 };
 
-avrgirlStk500v2.prototype.loadPage = function (memType, data, callback) {
+avrgirlStk500v2.prototype.loadAddress = callbackify(avrgirlStk500v2.prototype._loadAddressAsync);
+
+avrgirlStk500v2.prototype._loadPageAsync = async function (memType, data) {
   if (!Buffer.isBuffer(data)) {
-    return callback(new Error('Failed to write page: data was not Buffer'));
+    throw new Error('Failed to write page: data was not Buffer');
   }
 
   var lMSB = data.length >> 8;
@@ -183,13 +179,12 @@ avrgirlStk500v2.prototype.loadPage = function (memType, data, callback) {
 
   cmd = Buffer.concat([cmd, data]);
 
-  this.sendCmd(cmd, function (error) {
-    return callback(error);
-  });
+  await this._sendCmdAsync(cmd);
 };
 
-avrgirlStk500v2.prototype.writeMem = function (memType, hex, callback) {
-  var self = this;
+avrgirlStk500v2.prototype.loadPage = callbackify(avrgirlStk500v2.prototype._loadPageAsync);
+
+avrgirlStk500v2.prototype._writeMemAsync = async function (memType, hex) {
   var options = this.options.chip;
   var pageAddress = 0;
   var useAddress;
@@ -202,53 +197,41 @@ avrgirlStk500v2.prototype.writeMem = function (memType, hex, callback) {
       readFile = fs.readFileSync(hex, { encoding: 'utf8' });
     } catch (e) {
       if (e.code === 'ENOENT') {
-        return callback(new Error('could not write ' + memType + ': please supply a valid path to a hex file.'));
+        throw new Error('could not write ' + memType + ': please supply a valid path to a hex file.');
       } else {
-        return callback(e);
+        throw e;
       }
     }
 
     hex = intelhex.parse(readFile).data;
 
   } else if (!Buffer.isBuffer(hex)) {
-    return callback(new Error('could not write ' + memType + ': please supply either a hex buffer or a valid path to a hex file.'));
+    throw new Error('could not write ' + memType + ': please supply either a hex buffer or a valid path to a hex file.');
   }
 
-  async.whilst(
-    function testEndOfFile() {
-      // case for data being flashed being less than one page in size
-      if (pageAddress === 0 && hex.length < pageSize) {
-        return false;
-      }
-      return pageAddress < hex.length;
-    },
-    function programPage(pagedone) {
-      async.series([
-        function loadAddress(done) {
-          useAddress = pageAddress >> addressOffset;
-          self.loadAddress(memType, useAddress, done);
-        },
-        function writeToPage(done) {
-          data = hex.slice(pageAddress, (hex.length > pageSize ? (pageAddress + pageSize) : hex.length - 1))
-          self.loadPage(memType, data, done);
-        },
-        function calcNextPage(done) {
-          pageAddress = pageAddress + data.length;
-          done();
-        }
-      ],
-      function pageIsDone(error) {
-        pagedone(error);
-      });
-    },
-    function(error) {
-      return callback(error);
+  function testEndOfFile() {
+    // case for data being flashed being less than one page in size
+    if (pageAddress === 0 && hex.length < pageSize) {
+      return false;
     }
-  );
+    return pageAddress < hex.length;
+  }
+
+  while (testEndOfFile()) {
+    // load address
+    useAddress = pageAddress >> addressOffset;
+    await this._loadAddressAsync(memType, useAddress);
+    // write to page
+    data = hex.slice(pageAddress, (hex.length > pageSize ? (pageAddress + pageSize) : hex.length - 1))
+    await this._loadPageAsync(memType, data);
+    // calc next page
+    pageAddress = pageAddress + data.length;
+  }
 };
 
-avrgirlStk500v2.prototype.enterProgrammingMode = function (callback) {
-  var self = this;
+avrgirlStk500v2.prototype.writeMem = callbackify(avrgirlStk500v2.prototype._writeMemAsync);
+
+avrgirlStk500v2.prototype._enterProgrammingModeAsync = async function () {
   var options = this.options.chip;
   var enable = options.pgmEnable;
 
@@ -262,29 +245,35 @@ avrgirlStk500v2.prototype.enterProgrammingMode = function (callback) {
     enable[2], enable[3]
   ]);
 
-  this.sendCmd(cmd, function (error) {
-    //var error = error ? new Error('Failed to enter prog mode: programmer return status was not OK.') : null;
-    var error = error ? new Error(error) : null;
-    callback(error);
-  });
+  try {
+    await this._sendCmdAsync(cmd);
+  } catch (error) {
+    //var error = new Error('Failed to enter prog mode: programmer return status was not OK.');
+    var error = new Error(error);
+    throw error;
+  }
 };
 
-avrgirlStk500v2.prototype.exitProgrammingMode = function (callback) {
-  var self = this;
+avrgirlStk500v2.prototype.enterProgrammingMode = callbackify(avrgirlStk500v2.prototype._enterProgrammingModeAsync);
+
+avrgirlStk500v2.prototype._exitProgrammingModeAsync = async function () {
   var options = this.options.chip;
 
   var cmd = Buffer.from([
     C.CMD_LEAVE_PROGMODE_ISP, options.preDelay, options.postDelay
   ]);
 
-  this.sendCmd(cmd, function (error) {
-    var error = error ? new Error('Failed to leave prog mode: programmer return status was not OK.') : null;
-    callback(error);
-  });
+  try {
+    await this._sendCmdAsync(cmd);
+  } catch (error) {
+    var error = new Error('Failed to leave prog mode: programmer return status was not OK.');
+    throw error;
+  }
 };
 
-avrgirlStk500v2.prototype.eraseChip = function (callback) {
-  var self = this;
+avrgirlStk500v2.prototype.exitProgrammingMode = callbackify(avrgirlStk500v2.prototype._exitProgrammingModeAsync);
+
+avrgirlStk500v2.prototype._eraseChipAsync = async function () {
   var options = this.options.chip;
   var erase = options.erase;
 
@@ -295,66 +284,63 @@ avrgirlStk500v2.prototype.eraseChip = function (callback) {
     erase.cmd[2], erase.cmd[3]
   ]);
 
-  this.sendCmd(cmd, function (error) {
-    var error = error ? new Error('Failed to erase chip: programmer return status was not OK.') : null;
-    callback(error);
-  });
+  try {
+    await this._sendCmdAsync(cmd);
+  } catch (error) {
+    var error = new Error('Failed to erase chip: programmer return status was not OK.');
+    throw error;
+  }
 };
 
-avrgirlStk500v2.prototype.writeFlash = function (hex, callback) {
+avrgirlStk500v2.prototype.eraseChip = callbackify(avrgirlStk500v2.prototype._eraseChipAsync);
+
+avrgirlStk500v2.prototype._writeFlashAsync = async function (hex) {
   // optional convenience method
-  this.writeMem('flash', hex, function(error) {
-    return callback(error);
-  });
+  await this._writeMemAsync('flash', hex);
 };
 
-avrgirlStk500v2.prototype.writeEeprom = function (hex, callback) {
- // optional convenience method
- this.writeMem('eeprom', hex, function(error) {
-    callback(error);
-  });
-};
+avrgirlStk500v2.prototype.writeFlash = callbackify(avrgirlStk500v2.prototype._writeFlashAsync);
 
-avrgirlStk500v2.prototype.quickFlash = function (hex, callback) {
-  var self = this;
-  async.series([
-    self.enterProgrammingMode.bind(self),
-    self.writeFlash.bind(self, hex),
-    self.exitProgrammingMode.bind(self)
-    ], function (error) {
-      return callback(error);
-    }
-  );
-};
-
-avrgirlStk500v2.prototype.quickEeprom = function (hex, callback) {
-  var self = this;
-  async.series([
-    self.enterProgrammingMode.bind(self),
-    self.writeEeprom.bind(self, hex),
-    self.exitProgrammingMode.bind(self)
-    ], function (error) {
-      return callback(error);
-    }
-  );
-};
-
-avrgirlStk500v2.prototype.readFlash = function (length, callback) {
+avrgirlStk500v2.prototype._writeEepromAsync = async function (hex) {
   // optional convenience method
-  this.readMem('flash', length, function(error, data) {
-    callback(error, data);
-  });
+  await this._writeMemAsync('eeprom', hex);
 };
 
-avrgirlStk500v2.prototype.readEeprom = function (length, callback) {
- // optional convenience method
- this.readMem('eeprom', length, function(error, data) {
-    callback(error, data);
-  });
+avrgirlStk500v2.prototype.writeEeprom = callbackify(avrgirlStk500v2.prototype._writeEepromAsync);
+
+avrgirlStk500v2.prototype._quickFlashAsync = async function (hex) {
+  await this._enterProgrammingModeAsync();
+  await this._writeFlashAsync(hex);
+  await this._exitProgrammingModeAsync();
 };
 
-avrgirlStk500v2.prototype.readMem = function (memType, length, callback) {
-  var self = this;
+avrgirlStk500v2.prototype.quickFlash = callbackify(avrgirlStk500v2.prototype._quickFlashAsync);
+
+avrgirlStk500v2.prototype._quickEepromAsync = async function (hex) {
+  await this._enterProgrammingModeAsync();
+  await this._writeEepromAsync(hex);
+  await this._exitProgrammingModeAsync();
+};
+
+avrgirlStk500v2.prototype.quickEeprom = callbackify(avrgirlStk500v2.prototype._quickEepromAsync);
+
+avrgirlStk500v2.prototype._readFlashAsync = async function (length) {
+  // optional convenience method
+  var data = await this._readMemAsync('flash', length);
+  return data;
+};
+
+avrgirlStk500v2.prototype.readFlash = callbackify(avrgirlStk500v2.prototype._readFlashAsync);
+
+avrgirlStk500v2.prototype._readEepromAsync = async function (length) {
+  // optional convenience method
+  var data = await this._readMemAsync('eeprom', length);
+  return data;
+};
+
+avrgirlStk500v2.prototype.readEeprom = callbackify(avrgirlStk500v2.prototype._readEepromAsync);
+
+avrgirlStk500v2.prototype._readMemAsync = async function (memType, length) {
   var options = this.options.chip;
   var headLen = this.options.frameless ? 3 : 6;
   var cmd = memType === 'flash' ? C.CMD_READ_FLASH_ISP : C.CMD_READ_EEPROM_ISP
@@ -364,18 +350,23 @@ avrgirlStk500v2.prototype.readMem = function (memType, length, callback) {
     options[memType].read[0]
   ]);
 
-  this.write(buf, function (error) {
-    var error = error ? new Error('Failed to initiate read memory: programmer return status was not OK.') : null;
-    if (error) { return callback(error, null); }
-    self.read(length + headLen, function(error, data) {
-      var error = error ? new Error('Failed to read memory: programmer return status was not OK.') : null;
-      callback(error, data);
-    });
-  });
+  try {
+    await this._writeAsync(buf);
+  } catch (error) {
+    throw new Error('Failed to initiate read memory: programmer return status was not OK.');
+  }
+
+  try {
+    var data = await this._readAsync(length + headLen);
+    return data;
+  } catch (error) {
+    throw new Error('Failed to read memory: programmer return status was not OK.');
+  }
 };
 
-avrgirlStk500v2.prototype.getChipSignature = function (callback) {
-  var self = this;
+avrgirlStk500v2.prototype.readMem = callbackify(avrgirlStk500v2.prototype._readMemAsync);
+
+avrgirlStk500v2.prototype._getChipSignatureAsync = async function () {
   var options = this.options.chip;
   var signature = options.signature;
   var signatureLength = signature.size;
@@ -394,57 +385,45 @@ avrgirlStk500v2.prototype.getChipSignature = function (callback) {
 
   var response = Buffer.alloc(3);
 
-  function getSigByte() {
-    self.write(cmd, function (error) {
-      if (error) { return callback(error); }
-      self.read(readLen, function(error, data) {
-        if (error) { return callback(error); }
-        response[set] = data[sigPos];
-        set += 1;
-        cmd[4] = set;
-        if (set < signatureLength) {
-          getSigByte();
-        } else {
-          callback(null, response);
-        }
-      });
-    });
-  };
+  while (set < signatureLength) {
+    await this._writeAsync(cmd);
+    var data = await this._readAsync(readLen);
+    response[set] = data[sigPos];
+    set += 1;
+    cmd[4] = set;
+  }
 
-  getSigByte();
-
+  return response;
 };
+
+avrgirlStk500v2.prototype.getChipSignature = callbackify(avrgirlStk500v2.prototype._getChipSignatureAsync);
 
 avrgirlStk500v2.prototype.cmdSpiMulti = function (options, callback) {
   // // P02
   //options are [cmd, numTx, numRx, rxStartAddr, txData]
 };
 
-avrgirlStk500v2.prototype.readFuses = function (callback) {
-  var self = this;
+avrgirlStk500v2.prototype._readFusesAsync = async function () {
   var chip = this.options.chip;
   var fuses = chip.fuses;
   var reads = Object.keys(fuses.read);
   var fusePos = (this.options.frameless) ? 2 : 7;
   var response = {};
 
-  async.eachSeries(reads, function iterator(item, cb) {
-    self.readFuse(item, function(error, data) {
-      if (error) { return callback(new Error(error), null); }
-      response[item] = data;
-      cb();
-    });
-  }, function done() {
-    callback(null, response);
-  });
-};
-
-avrgirlStk500v2.prototype.readFuse = function (fuseType, callback) {
-  if ((typeof fuseType).toLowerCase() !== 'string') {
-    return callback(new Error('Failed to read fuse: fuse type should be a string'));
+  for (let item of reads) {
+    response[item] = await this._readFuseAsync(item);
   }
 
-  var self = this;
+  return response;
+};
+
+avrgirlStk500v2.prototype.readFuses = callbackify(avrgirlStk500v2.prototype._readFusesAsync);
+
+avrgirlStk500v2.prototype._readFuseAsync = async function (fuseType) {
+  if ((typeof fuseType).toLowerCase() !== 'string') {
+    throw new Error('Failed to read fuse: fuse type should be a string');
+  }
+
   var chip = this.options.chip;
   var fuse = chip.fuses.read[fuseType];
   var readLen = (this.options.frameless) ? 4 : 10;
@@ -457,18 +436,15 @@ avrgirlStk500v2.prototype.readFuse = function (fuseType, callback) {
 
   var cmdf = Buffer.concat([cmd, Buffer.from(fuse)], cmd.length + fuse.length);
 
-  self.write(cmdf, function (error) {
-    if (error) { callback(error); }
-    self.read(readLen, function(error, data) {
-      if (error) { callback(error); }
-      response = Buffer.from([data[fusePos]]);
-      callback(null, response);
-    });
-  });
+  await this._writeAsync(cmdf);
+  var data = await this._readAsync(readLen);
+  var response = Buffer.from([data[fusePos]]);
+  return response;
 };
 
-avrgirlStk500v2.prototype.writeFuse = function (fuseType, value, callback) {
-  var self = this;
+avrgirlStk500v2.prototype.readFuse = callbackify(avrgirlStk500v2.prototype._readFuseAsync);
+
+avrgirlStk500v2.prototype._writeFuseAsync = async function (fuseType, value) {
   var options = this.options.chip;
   var frameless = this.options.frameless;
   var readLen = frameless ? 3 : 9;
@@ -481,44 +457,50 @@ avrgirlStk500v2.prototype.writeFuse = function (fuseType, value, callback) {
     fuseCmd[2], value
   ]);
 
-  this.write(cmd, function (error) {
-    if (error) { callback(error); }
-    self.read(readLen, function (error, data) {
-      if (data[statusPos] !== C.STATUS_CMD_OK) {
-        error = new Error('Failed to program fuse: programmer return status was not OK.');
-      }
-      callback(null);
-    });
-  });
+  await this._writeAsync(cmd);
+  var data = await this._readAsync(readLen);
+  if (data[statusPos] !== C.STATUS_CMD_OK) {
+    throw new Error('Failed to program fuse: programmer return status was not OK.');
+  }
 };
 
-avrgirlStk500v2.prototype.setParameter = function (param, value, callback) {
+avrgirlStk500v2.prototype.writeFuse = callbackify(avrgirlStk500v2.prototype._writeFuseAsync);
+
+avrgirlStk500v2.prototype._setParameterAsync = async function (param, value) {
   var cmd = Buffer.from([
     C.CMD_SET_PARAMETER,
     param, value
   ]);
 
-  this.sendCmd(cmd, function (error) {
-    var error = error ? new Error('Failed to set parameter: programmer return status was not OK.') : null;
-    callback(error);
-  });
+  try {
+    await this._sendCmdAsync(cmd);
+  } catch (error) {
+    throw new Error('Failed to set parameter: programmer return status was not OK.');
+  }
 };
 
-avrgirlStk500v2.prototype.getParameter = function (param, callback) {
-  var self = this;
+avrgirlStk500v2.prototype.setParameter = callbackify(avrgirlStk500v2.prototype._setParameterAsync);
+
+avrgirlStk500v2.prototype._getParameterAsync = async function (param) {
   var cmd = Buffer.from([
     C.CMD_GET_PARAMETER,
     param
   ]);
 
-  this.write(cmd, function (error) {
-    var error = error ? new Error('Failed to get parameter: programmer return status was not OK.') : null;
-    if (error) { return callback(error, null); }
-    self.read(8, function(error, data) {
-      var error = error ? new Error('Failed to get parameter: programmer return status was not OK.') : null;
-      callback(error, data);
-    });
-  });
+  try {
+    await this._writeAsync(cmd);
+  } catch (error) {
+    throw new Error('Failed to get parameter: programmer return status was not OK.');
+  }
+
+  try {
+    var data = await this._readAsync(8);
+    return data;
+  } catch (error) {
+    throw new Error('Failed to get parameter: programmer return status was not OK.');
+  }
 };
+
+avrgirlStk500v2.prototype.getParameter = callbackify(avrgirlStk500v2.prototype._getParameterAsync);
 
 module.exports = avrgirlStk500v2;

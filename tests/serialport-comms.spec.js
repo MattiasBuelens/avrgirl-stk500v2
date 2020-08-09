@@ -1,5 +1,5 @@
 // harness
-var test = require('tape');
+var test = require('tape-promise/tape');
 // test helpers
 var sinon = require('sinon');
 var vserial = require('virtual-serialport');
@@ -70,42 +70,38 @@ test('[ SERIALPORT-COMMS ] ::close', function (t) {
   t.ok(spy.calledOnce, 'called device.close');
 });
 
-test('[ SERIALPORT-COMMS ] ::write', function (t) {
+test('[ SERIALPORT-COMMS ] ::write', async function (t) {
   var b = new serialcom(device);
   var buf = Buffer.from([0x01]);
 
   t.plan(1);
 
   var spy = sinon.spy(device, 'write');
-  b.write(buf);
+  await b.write(buf);
   var cond = (spy.calledOnce && spy.args[0][0] && buf.equals(spy.args[0][0]));
   t.ok(cond, 'called write method on correct endpoint with correct buffer arg');
 });
 
-test('[ SERIALPORT-COMMS ] ::read', function (t) {
+test('[ SERIALPORT-COMMS ] ::read', async function (t) {
   var b = new serialcom(device);
   b.responses.push(Buffer.alloc(8));
   var spy = sinon.spy(b, 'read');
-  t.plan(3);
+  t.plan(2);
 
-  b.read(8, function(error, data){
-    t.error(error, 'no error');
-    t.ok(spy.calledWith(8), 'called read method on correct endpoint with arg 8');
-    t.equals(data.length, 8, 'got data');
-  });
+  var data = await b.read(8);
+  t.ok(spy.calledWith(8), 'called read method on correct endpoint with arg 8');
+  t.equals(data.length, 8, 'got data');
 });
 
-test('[ SERIALPORT-COMMS ] ::setUpInterface', function (t) {
+test('[ SERIALPORT-COMMS ] ::setUpInterface', async function (t) {
   var b = new serialcom(device);
-  var stub = sinon.stub(b, 'sync', function(callback) {
-    return callback(null);
+  var stub = sinon.stub(b, 'sync', function() {
+    return Promise.resolve();
   });
 
-  t.plan(3);
+  t.plan(2);
 
-  b.setUpInterface(function (error) {
-    t.pass('interface set up and called back');
-    t.error(error, 'no error');
-    t.ok(stub.calledOnce, 'sync method called');
-  });
+  await b.setUpInterface();
+  t.pass('interface set up and called back');
+  t.ok(stub.calledOnce, 'sync method called');
 });

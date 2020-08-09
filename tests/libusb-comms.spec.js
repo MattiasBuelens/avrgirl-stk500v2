@@ -1,5 +1,5 @@
 // harness
-var test = require('tape');
+var test = require('tape-promise/tape');
 // test helpers
 var sinon = require('sinon');
 var usb = require('mock-usb');
@@ -47,47 +47,41 @@ test('[ LIBUSB-COMMS ] ::close', function (t) {
   t.ok(spy.calledOnce, 'called device.close');
 });
 
-test('[ LIBUSB-COMMS ] ::write', function (t) {
+test('[ LIBUSB-COMMS ] ::write', async function (t) {
   var b = new libusb(device);
   var buf = Buffer.from([0x01]);
 
-  t.plan(2);
+  t.plan(1);
 
   b.open();
-  b.setUpInterface(function (error) {
-    var spy = sinon.spy(b.conn.endpointOut, 'transfer');
-    b.write(buf, function(error){
-      t.error(error, 'no error');
-      var cond = (spy.calledOnce && spy.args[0][0] && buf.equals(spy.args[0][0]));
-      t.ok(cond, 'called transfer method on correct endpoint with correct buffer arg');
-    });
-  });
+  await b.setUpInterface();
+
+  var spy = sinon.spy(b.conn.endpointOut, 'transfer');
+  await b.write(buf);
+  var cond = (spy.calledOnce && spy.args[0][0] && buf.equals(spy.args[0][0]));
+  t.ok(cond, 'called transfer method on correct endpoint with correct buffer arg');
 });
 
-test('[ LIBUSB-COMMS ] ::read', function (t) {
+test('[ LIBUSB-COMMS ] ::read', async function (t) {
+  var b = new libusb(device);
+
+  t.plan(1);
+
+  b.open();
+  await b.setUpInterface();
+
+  var spy = sinon.spy(b.conn.endpointIn, 'transfer');
+  await b.read(8);
+  t.ok(spy.calledWith(8), 'called transfer method on correct endpoint with arg 8');
+});
+
+test('[ LIBUSB-COMMS ] ::setUpInterface', async function (t) {
   var b = new libusb(device);
 
   t.plan(2);
 
   b.open();
-  b.setUpInterface(function (error) {
-    var spy = sinon.spy(b.conn.endpointIn, 'transfer');
-    b.read(8, function(error){
-      t.error(error, 'no error');
-      t.ok(spy.calledWith(8), 'called transfer method on correct endpoint with arg 8');
-    });
-  });
-});
-
-test('[ LIBUSB-COMMS ] ::setUpInterface', function (t) {
-  var b = new libusb(device);
-
-  t.plan(3);
-
-  b.open();
-  b.setUpInterface(function (error) {
-    t.error(error, 'no error');
-    t.equal(typeof b.conn.endpointOut, 'object', 'endpointOut object was set up');
-    t.equal(typeof b.conn.endpointIn, 'object', 'endpointIn object was set up');
-  });
+  await b.setUpInterface();
+  t.equal(typeof b.conn.endpointOut, 'object', 'endpointOut object was set up');
+  t.equal(typeof b.conn.endpointIn, 'object', 'endpointIn object was set up');
 });
